@@ -75,7 +75,13 @@ export HF_TOKEN=<your access token>
 ### Generate an image guided by a single text prompt
 
 ```bash
-python3 demo_txt2img.py "a beautiful photograph of Mt. Fuji during cherry blossom" --hf-token=$HF_TOKEN -v
+python3 demo_txt2img_controlnet.py "a beautiful photograph of Mt. Fuji during cherry blossom" --hf-token=$HF_TOKEN -v --version 1.5 --denoising-steps 20
+```
+
+### Controlnet
+
+```bash
+python3 demo_txt2img_controlnet.py "bird" --hf-token=$HF_TOKEN -v --version 1.5 --denoising-steps 20
 ```
 
 ### Generate an image guided by an image and single text prompt

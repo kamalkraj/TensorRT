@@ -17,7 +17,7 @@
 
 from cuda import cudart
 import gc
-from models import make_CLIP, make_tokenizer, make_UNet, make_VAE, make_VAEEncoder
+from models import make_CLIP, make_tokenizer, make_UNet, make_VAE, make_VAEEncoder, make_ControlNet
 import numpy as np
 import nvtx
 import os
@@ -125,6 +125,7 @@ class StableDiffusionPipeline:
 
         self.stages = stages
         self.inpaint = inpaint
+        self.controlnet = True if "controlnet" in stages else False
 
         self.stream = None # loaded in loadResources()
         self.tokenizer = None # loaded in loadResources()
@@ -239,9 +240,11 @@ class StableDiffusionPipeline:
         if 'clip' in self.stages:
             self.models['clip'] = make_CLIP(inpaint=self.inpaint, **models_args)
         if 'unet' in self.stages:
-            self.models['unet'] = make_UNet(inpaint=self.inpaint, **models_args)
+            self.models['unet'] = make_UNet(inpaint=self.inpaint, controlnet=self.controlnet, **models_args)
         if 'vae' in self.stages:
             self.models['vae'] = make_VAE(inpaint=self.inpaint, **models_args)
+        if 'controlnet' in self.stages:
+            self.models['controlnet'] = make_ControlNet(inpaint=self.inpaint, **models_args)
 
         # Export models to ONNX
         for model_name, obj in self.models.items():
@@ -381,7 +384,7 @@ class StableDiffusionPipeline:
 
         return text_embeddings
 
-    def denoise_latent(self, latents, text_embeddings, timesteps=None, step_offset=0, mask=None, masked_image_latents=None):
+    def denoise_latent(self, latents, text_embeddings, timesteps=None, step_offset=0, mask=None, masked_image_latents=None, controlnet_image=None, controlnet_conditioning_scale=1.0):
         cudart.cudaEventRecord(self.events['denoise-start'], 0)
         if not isinstance(timesteps, torch.Tensor):
             timesteps = self.scheduler.timesteps
@@ -392,6 +395,74 @@ class StableDiffusionPipeline:
             # Expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2)
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, step_offset + step_index, timestep)
+            timestep_float = timestep.float() if timestep.dtype != torch.float32 else timestep
+            
+            sample_inp = device_view(latent_model_input)
+            timestep_inp = device_view(timestep_float)
+            embeddings_inp = device_view(text_embeddings)
+
+            controlnet_input_to_unet = {}
+
+            if isinstance(controlnet_image, torch.Tensor):
+                controlnet_cond_inp = device_view(controlnet_image)
+
+                input_dict = {"sample": sample_inp, 
+                              "timestep": timestep_inp, 
+                              "encoder_hidden_states": embeddings_inp, 
+                              "controlnet_cond": controlnet_cond_inp,}
+                controlnet_output = self.runEngine('controlnet', input_dict)
+
+                down_block_res_samples = [
+                    controlnet_output['down_block_res_samples_0'],
+                    controlnet_output['down_block_res_samples_1'],
+                    controlnet_output['down_block_res_samples_2'],
+                    controlnet_output['down_block_res_samples_3'],
+                    controlnet_output['down_block_res_samples_4'],
+                    controlnet_output['down_block_res_samples_5'],
+                    controlnet_output['down_block_res_samples_6'],
+                    controlnet_output['down_block_res_samples_7'],
+                    controlnet_output['down_block_res_samples_8'],
+                    controlnet_output['down_block_res_samples_9'],
+                    controlnet_output['down_block_res_samples_10'],
+                    controlnet_output['down_block_res_samples_11'],
+                ]
+                mid_block_res_sample = controlnet_output['mid_block_res_sample']
+
+                down_block_res_samples = [
+                        down_block_res_sample * controlnet_conditioning_scale
+                        for down_block_res_sample in down_block_res_samples
+                    ]
+                mid_block_res_sample *= controlnet_conditioning_scale
+
+                down_block_res_samples_0_inp = device_view(down_block_res_samples[0])
+                down_block_res_samples_1_inp = device_view(down_block_res_samples[1])
+                down_block_res_samples_2_inp = device_view(down_block_res_samples[2])
+                down_block_res_samples_3_inp = device_view(down_block_res_samples[3])
+                down_block_res_samples_4_inp = device_view(down_block_res_samples[4])
+                down_block_res_samples_5_inp = device_view(down_block_res_samples[5])
+                down_block_res_samples_6_inp = device_view(down_block_res_samples[6])
+                down_block_res_samples_7_inp = device_view(down_block_res_samples[7])
+                down_block_res_samples_8_inp = device_view(down_block_res_samples[8])
+                down_block_res_samples_9_inp = device_view(down_block_res_samples[9])
+                down_block_res_samples_10_inp = device_view(down_block_res_samples[10])
+                down_block_res_samples_11_inp = device_view(down_block_res_samples[11])
+                mid_block_res_sample_inp = device_view(mid_block_res_sample)
+
+                controlnet_input_to_unet = {'dbar_0': down_block_res_samples_0_inp,
+                                            'dbar_1': down_block_res_samples_1_inp,
+                                            'dbar_2': down_block_res_samples_2_inp,
+                                            'dbar_3': down_block_res_samples_3_inp, 
+                                            'dbar_4': down_block_res_samples_4_inp, 
+                                            'dbar_5': down_block_res_samples_5_inp, 
+                                            'dbar_6': down_block_res_samples_6_inp, 
+                                            'dbar_7': down_block_res_samples_7_inp, 
+                                            'dbar_8': down_block_res_samples_8_inp, 
+                                            'dbar_9': down_block_res_samples_9_inp, 
+                                            'dbar_10': down_block_res_samples_10_inp, 
+                                            'dbar_11': down_block_res_samples_11_inp,
+                                            'mid_block_additional_residual': mid_block_res_sample_inp
+                                            }
+
             if isinstance(mask, torch.Tensor):
                 latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
             if self.nvtx_profile:
@@ -402,12 +473,14 @@ class StableDiffusionPipeline:
                 nvtx_unet = nvtx.start_range(message='unet', color='blue')
 
             embeddings_dtype = np.float16
-            timestep_float = timestep.float() if timestep.dtype != torch.float32 else timestep
 
-            sample_inp = device_view(latent_model_input)
-            timestep_inp = device_view(timestep_float)
-            embeddings_inp = device_view(text_embeddings)
-            noise_pred = self.runEngine('unet', {"sample": sample_inp, "timestep": timestep_inp, "encoder_hidden_states": embeddings_inp})['latent']
+            input_dict = {"sample": sample_inp, 
+                          "timestep": timestep_inp, 
+                          "encoder_hidden_states": embeddings_inp}
+            if controlnet_input_to_unet:
+                input_dict.update(controlnet_input_to_unet)
+
+            noise_pred = self.runEngine('unet', input_dict)['latent']
             if self.nvtx_profile:
                 nvtx.end_range(nvtx_unet)
 
